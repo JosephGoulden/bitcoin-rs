@@ -1,50 +1,24 @@
-use futures::{Async, Future, Poll};
 use message::{MessageHeader, MessageResult};
 use network::Magic;
-use std::io;
-use tokio_io::io::{read_exact, ReadExact};
-use tokio_io::AsyncRead;
+use crate::io::SharedTcpStream;
 
-pub fn read_header<A>(a: A, magic: Magic) -> ReadHeader<A>
-where
-	A: AsyncRead,
-{
-	ReadHeader {
-		reader: read_exact(a, [0u8; 24]),
-		magic,
-	}
-}
-
-pub struct ReadHeader<A> {
-	reader: ReadExact<A, [u8; 24]>,
-	magic: Magic,
-}
-
-impl<A> Future for ReadHeader<A>
-where
-	A: AsyncRead,
-{
-	type Item = (A, MessageResult<MessageHeader>);
-	type Error = io::Error;
-
-	fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-		let (read, data) = try_ready!(self.reader.poll());
-		let header = MessageHeader::deserialize(&data, self.magic);
-		Ok(Async::Ready((read, header)))
-	}
+pub async fn read_header(a: &SharedTcpStream, magic: Magic) -> MessageResult<MessageHeader> {
+	let mut buf= [0u8; 24];
+	a.read_exact(&mut buf).await;
+	MessageHeader::deserialize(&buf, magic)
 }
 
 #[cfg(test)]
 mod tests {
 	use super::read_header;
-	use bytes::Bytes;
-	use futures::Future;
 	use message::{Error, MessageHeader};
 	use network::Network;
+	use crate::bytes::Bytes;
+	use crate::io::shared_tcp_stream::SharedTcpStream;
 
-	#[test]
-	fn test_read_header() {
-		let raw: Bytes = "f9beb4d96164647200000000000000001f000000ed52399b".into();
+	#[tokio::test]
+	async fn test_read_header() {
+		let stream = SharedTcpStream::new("f9beb4d96164647200000000000000001f000000ed52399b".into());
 		let expected = MessageHeader {
 			magic: Network::Mainnet.magic(),
 			command: "addr".into(),
@@ -52,25 +26,25 @@ mod tests {
 			checksum: "ed52399b".into(),
 		};
 
-		assert_eq!(read_header(raw.as_ref(), Network::Mainnet.magic()).wait().unwrap().1, Ok(expected));
+		assert_eq!(read_header(&stream, Network::Mainnet.magic()).await, Ok(expected));
 		assert_eq!(
-			read_header(raw.as_ref(), Network::Testnet.magic()).wait().unwrap().1,
+			read_header(&stream, Network::Testnet.magic()).await,
 			Err(Error::InvalidMagic)
 		);
 	}
 
-	#[test]
-	fn test_read_header_with_invalid_magic() {
-		let raw: Bytes = "f9beb4d86164647200000000000000001f000000ed52399b".into();
+	#[tokio::test]
+	async fn test_read_header_with_invalid_magic() {
+		let stream = SharedTcpStream::new("f9beb4d86164647200000000000000001f000000ed52399b".into());
 		assert_eq!(
-			read_header(raw.as_ref(), Network::Testnet.magic()).wait().unwrap().1,
+			read_header(&stream, Network::Testnet.magic()).await,
 			Err(Error::InvalidMagic)
 		);
 	}
 
-	#[test]
-	fn test_read_too_short_header() {
-		let raw: Bytes = "f9beb4d96164647200000000000000001f000000ed5239".into();
-		assert!(read_header(raw.as_ref(), Network::Mainnet.magic()).wait().is_err());
+	#[tokio::test]
+	async fn test_read_too_short_header() {
+		let stream = SharedTcpStream::new("f9beb4d96164647200000000000000001f000000ed5239".into());
+		assert!(read_header(&stream, Network::Mainnet.magic()).await.is_err());
 	}
 }

@@ -1,47 +1,20 @@
-use futures::{Async, Future, Poll, Select};
+//use futures::{Async, Future, Poll, Select, FutureExt};
 use std::io;
 use std::time::Duration;
-use tokio_core::reactor::{Handle, Timeout};
+use std::future::Future;
+use tokio::time::{timeout};
 
-type DeadlineBox<F> = Box<dyn Future<Item = DeadlineStatus<<F as Future>::Item>, Error = <F as Future>::Error> + Send>;
-
-pub fn deadline<F, T>(duration: Duration, handle: &Handle, future: F) -> Result<Deadline<F>, io::Error>
+pub async fn deadline<F, T>(duration: Duration, future: F) -> Result<DeadlineStatus<T>, io::Error>
 where
-	F: Future<Item = T, Error = io::Error> + Send + 'static,
-	T: 'static,
+	F: Future<Output = T> + Send,
 {
-	let timeout: DeadlineBox<F> = Box::new(Timeout::new(duration, handle)?.map(|_| DeadlineStatus::Timeout));
-	let future: DeadlineBox<F> = Box::new(future.map(DeadlineStatus::Meet));
-	let deadline = Deadline {
-		future: timeout.select(future),
-	};
-	Ok(deadline)
+	match timeout(duration, future).await {
+		Ok(value) => Ok(DeadlineStatus::Meet(value)),
+		_ => Ok(DeadlineStatus::Timeout)
+	}
 }
 
 pub enum DeadlineStatus<T> {
 	Meet(T),
 	Timeout,
-}
-
-pub struct Deadline<F>
-where
-	F: Future + Send,
-{
-	future: Select<DeadlineBox<F>, DeadlineBox<F>>,
-}
-
-impl<F, T> Future for Deadline<F>
-where
-	F: Future<Item = T, Error = io::Error> + Send,
-{
-	type Item = DeadlineStatus<T>;
-	type Error = io::Error;
-
-	fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-		match self.future.poll() {
-			Ok(Async::Ready((result, _other))) => Ok(Async::Ready(result)),
-			Ok(Async::NotReady) => Ok(Async::NotReady),
-			Err((err, _other)) => Err(err),
-		}
-	}
 }

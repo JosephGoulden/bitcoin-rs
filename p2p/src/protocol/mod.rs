@@ -2,7 +2,6 @@ mod addr;
 mod ping;
 mod sync;
 
-use bytes::Bytes;
 use message::common::Command;
 use message::Error;
 
@@ -12,6 +11,7 @@ pub use self::sync::{
 	InboundSyncConnection, InboundSyncConnectionRef, InboundSyncConnectionState, InboundSyncConnectionStateRef, LocalSyncNode,
 	LocalSyncNodeRef, OutboundSyncConnection, OutboundSyncConnectionRef, SyncProtocol,
 };
+use crate::bytes::Bytes;
 
 pub trait Protocol: Send {
 	/// Initialize the protocol.

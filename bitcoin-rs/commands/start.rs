@@ -8,6 +8,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
 use sync::{create_local_sync_node, create_sync_connection_factory, create_sync_peers, SyncListener};
+use tokio::runtime::Runtime;
+use tokio::runtime;
 
 enum BlockNotifierTask {
 	NewBlock(H256),
@@ -83,14 +85,22 @@ impl Drop for BlockNotifier {
 }
 
 pub fn start(cfg: config::Config) -> Result<(), String> {
-	let mut el = p2p::event_loop();
+	let mut threaded_rt: Runtime = runtime::Builder::new()
+		.threaded_scheduler()
+		.enable_io()
+		.enable_time()
+		.build()
+		.expect("Unable to create tokio runtime");
 
+	threaded_rt.block_on(start_async(cfg))
+}
+
+pub async fn start_async(cfg: config::Config) -> Result<(), String> {
 	init_db(&cfg)?;
 
 	let nodes_path = node_table_path(&cfg);
 
 	let p2p_cfg = p2p::Config {
-		threads: cfg.p2p_threads,
 		inbound_connections: cfg.inbound_connections,
 		outbound_connections: cfg.outbound_connections,
 		connection: p2p::NetConfig {
@@ -119,18 +129,20 @@ pub fn start(cfg: config::Config) -> Result<(), String> {
 	}
 
 	let db_path = db_path(&cfg.data_dir);
-	let p2p = p2p::P2P::new(p2p_cfg, sync_connection_factory, el.handle()).map_err(|x| x.to_string())?;
+	let p2p = p2p::P2P::new(p2p_cfg, sync_connection_factory).map_err(|e| e.to_string())?;
 	let rpc_deps = rpc::Dependencies {
 		db_path,
 		network: cfg.network,
 		storage: cfg.db,
 		local_sync_node,
 		p2p_context: p2p.context().clone(),
-		remote: el.remote(),
 	};
 	let _rpc_server = rpc::new_http(cfg.rpc_config, rpc_deps)?;
 
-	p2p.run().map_err(|_| "Failed to start p2p module")?;
-	el.run(p2p::forever()).unwrap();
+	let _portal = portal::start();
+//	tokio::spawn(portal);
+
+	p2p.run().await;
+
 	Ok(())
 }
