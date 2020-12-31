@@ -6,15 +6,15 @@ use log::info;
 use std::collections::{HashMap, HashSet};
 
 /// print some statistics on a db
-pub fn stats(db: &Hammersbald) {
+pub fn stats(db: &mut Hammersbald) {
 	let (step, log_mod, blen, tlen, dlen, llen, sip0, sip1) = db.params();
 	info!("File sizes: table: {}, data: {}, links: {}", tlen, dlen, llen);
 	info!("Hash table: buckets: {}, log_mod: {}, step: {}", blen, log_mod, step);
 
 	let mut pointers = HashSet::new();
-	for bucket in db.buckets() {
-		if bucket.stored.is_valid() {
-			pointers.insert(bucket.stored);
+	for (pref, _) in db.buckets() {
+		if pref.is_valid() {
+			pointers.insert(pref);
 		}
 	}
 
@@ -35,13 +35,12 @@ pub fn stats(db: &Hammersbald) {
 	let mut roots = HashMap::new();
 	let mut n_slots = 0;
 	let mut used_buckets = 0;
-	for bucket in db.buckets() {
-		let slots = bucket.slots.unwrap_or_default();
-		if slots.len() > 0 {
+	for (_, bucket) in db.buckets() {
+		if bucket.slots.len() > 0 {
 			used_buckets += 1;
-			n_slots += slots.len();
+			n_slots += bucket.slots.len();
 		}
-		for slot in slots.iter() {
+		for slot in bucket.slots.iter() {
 			if slot.1.is_valid() {
 				roots.entry(slot.1).or_insert(Vec::new()).push(slot.0);
 			}

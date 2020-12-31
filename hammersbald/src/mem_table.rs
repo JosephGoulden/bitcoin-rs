@@ -12,11 +12,13 @@ use rand::{thread_rng, RngCore};
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::RwLock;
+use parking_lot::RwLock;
+use lru::LruCache;
 
 pub const BUCKET_FILL_TARGET: usize = 64;
 const INIT_BUCKETS: usize = 512;
 const INIT_LOGMOD: usize = 8;
+const BUCKET_CACHE_MAX_SIZE: usize = 10000;
 
 pub struct MemTable {
 	step: usize,
@@ -24,7 +26,8 @@ pub struct MemTable {
 	log_mod: u32,
 	sip0: u64,
 	sip1: u64,
-	buckets: RwLock<Vec<Bucket>>,
+	link_prefs: Vec<PRef>,
+	buckets: RwLock<LruCache<usize, Bucket>>,
 	dirty: Dirty,
 	log_file: LogFile,
 	data_file: DataFile,
@@ -42,7 +45,8 @@ impl MemTable {
 			forget: 0,
 			sip0: rng.next_u64(),
 			sip1: rng.next_u64(),
-			buckets: RwLock::new(vec![Bucket::default(); INIT_BUCKETS]),
+			link_prefs: vec![PRef::invalid(); INIT_BUCKETS],
+			buckets: RwLock::new(LruCache::unbounded()),
 			dirty: Dirty::new(INIT_BUCKETS),
 			log_file,
 			table_file,
@@ -55,7 +59,7 @@ impl MemTable {
 		(
 			self.step,
 			self.log_mod,
-			self.buckets.read().unwrap().len(),
+			self.link_prefs.len(),
 			self.table_file.len().unwrap(),
 			self.data_file.len().unwrap(),
 			self.link_file.len().unwrap(),
@@ -106,7 +110,8 @@ impl MemTable {
 	pub fn load(&mut self) -> Result<(), Error> {
 		if let Some(first) = self.table_file.read_page(PRef::from(0))? {
 			let n_buckets = first.read_pref(0).as_u64() as u32;
-			self.buckets = RwLock::new(vec![Bucket::default(); n_buckets as usize]);
+			self.link_prefs = vec![PRef::invalid(); n_buckets as usize];
+			self.buckets = RwLock::new(LruCache::unbounded());
 			self.dirty = Dirty::new(n_buckets as usize);
 			self.step = first.read_pref(6).as_u64() as usize;
 			self.log_mod = (32 - n_buckets.leading_zeros()) as u32 - 2;
@@ -114,11 +119,9 @@ impl MemTable {
 			self.sip1 = first.read_u64(20);
 		}
 
-		let mut buckets = self.buckets.write().unwrap();
-
 		for (i, link) in self.table_file.iter().enumerate() {
-			if i < buckets.len() {
-				buckets[i].stored = link;
+			if i < self.link_prefs.len() {
+				self.link_prefs[i] = link;
 			} else {
 				break;
 			}
@@ -127,15 +130,36 @@ impl MemTable {
 		Ok(())
 	}
 
-	fn resolve_bucket(&self, bucket_number: usize) -> Result<(), Error> {
-		if let Some(bucket) = self.buckets.write().unwrap().get_mut(bucket_number) {
-			if bucket.slots.is_none() {
-				if bucket.stored.is_valid() {
-					if let Ok(Payload::Link(link)) = self.link_file.get_envelope(bucket.stored)?.payload() {
-						bucket.slots = Some(link.slots());
+	fn resolve_bucket(&mut self, bucket_number: usize) -> Result<(), Error> {
+		let mut to_flush = vec![];
+		{
+			let mut buckets = self.buckets.write();
+			if let Some(pref) = self.link_prefs.get(bucket_number) {
+				if buckets.peek(&bucket_number).is_none() {
+					if pref.is_valid() {
+						if let Ok(env) = self.link_file.get_envelope(*pref) {
+							if env.len() > 0 {
+								if let Ok(Payload::Link(link)) = env.payload() {
+									let bucket = Bucket { slots: link.slots() };
+									buckets.put(bucket_number, bucket);
+								}
+							}
+						}
 					}
 				}
 			}
+			if buckets.peek(&bucket_number).is_none() {
+				buckets.put(bucket_number, Bucket::default());
+			}
+			while buckets.len() > BUCKET_CACHE_MAX_SIZE {
+				let (num, _) = buckets.pop_lru().unwrap();
+				if self.dirty.get(num) {
+					to_flush.push(num);
+				}
+			}
+		}
+		for num in to_flush {
+			self.flush_bucket(num)?;
 		}
 		Ok(())
 	}
@@ -145,7 +169,7 @@ impl MemTable {
 			// first page
 			let fp = PRef::from(0);
 			let mut page = self.table_file.read_page(fp)?.unwrap_or(Self::invalid_offsets_page(fp));
-			page.write_pref(0, PRef::from(self.buckets.read().unwrap().len() as u64));
+			page.write_pref(0, PRef::from(self.link_prefs.len() as u64));
 			page.write_pref(6, PRef::from(self.step as u64));
 			page.write_u64(12, self.sip0);
 			page.write_u64(20, self.sip1);
@@ -153,34 +177,45 @@ impl MemTable {
 		}
 		if self.dirty.is_dirty() {
 			let dirty_iterator = DirtyIterator::new(&self.dirty);
-			for (bucket_number, _) in dirty_iterator.enumerate().filter(|a| a.1) {
-				let bucket_pref = TableFile::table_offset(bucket_number);
-				if let Some(mut bucket) = self.buckets.write().unwrap().get_mut(bucket_number) {
-					let mut page = self
-						.table_file
-						.read_page(bucket_pref.this_page())?
-						.unwrap_or_else(|| Self::invalid_offsets_page(bucket_pref.this_page()));
-					if let Some(ref slots) = bucket.slots {
-						let link = if slots.len() > 0 {
-							let links = Link::from_slots(slots);
-							let payload = Link::deserialize(links.as_slice()).to_payload();
-							if bucket.stored == PRef::default() {
-								self.link_file.append(payload)?
-							} else {
-								self.link_file.update(bucket.stored, payload)?;
-								bucket.stored
-							}
-						} else {
-							PRef::invalid()
-						};
-						bucket.stored = link;
-						page.write_pref(bucket_pref.in_page_pos(), link);
-						self.table_file.update_page(page)?;
-					}
-				}
+			let dirty: Vec<usize> = dirty_iterator.enumerate().filter(|a| a.1).map(|a| a.0).collect();
+			for bucket_number in dirty {
+				self.flush_bucket(bucket_number)?;
 			}
 		}
 		self.dirty.clear();
+		Ok(())
+	}
+
+	fn flush_bucket(&mut self, bucket_number: usize) -> Result<(), Error> {
+		if let Some(link_pref) = self.link_prefs.get(bucket_number).cloned() {
+			let mut buckets = self.buckets.write();
+			if let Some(bucket) = buckets.get_mut(&bucket_number) {
+				let bucket_pref = TableFile::table_offset(bucket_number);
+				let mut page = self
+					.table_file
+					.read_page(bucket_pref.this_page())?
+					.unwrap_or_else(|| Self::invalid_offsets_page(bucket_pref.this_page()));
+
+				let link = if bucket.slots.len() > 0 {
+					let links = Link::from_slots(&bucket.slots);
+					let payload = Link::deserialize(links.as_slice()).to_payload();
+					if link_pref == PRef::invalid() {
+						self.link_file.append(payload)?
+					} else {
+						self.link_file.update(link_pref, payload)?;
+						link_pref
+					}
+				} else {
+					PRef::invalid()
+				};
+				self.link_prefs[bucket_number] = link;
+				page.write_pref(bucket_pref.in_page_pos(), link);
+				self.table_file.update_page(page)?;
+				self.dirty.clean(bucket_number);
+			}
+		} else {
+			return Err(Error::Corrupted(format!("Bucket {} not found", bucket_number)))
+		}
 		Ok(())
 	}
 
@@ -198,7 +233,7 @@ impl MemTable {
 		page
 	}
 
-	pub fn buckets(&self) -> BucketIterator {
+	pub fn buckets(&mut self) -> BucketIterator {
 		BucketIterator { file: self, n: 0 }
 	}
 
@@ -245,7 +280,7 @@ impl MemTable {
 					self.step = 0;
 				}
 
-				self.buckets.write().unwrap().push(Bucket::default());
+				self.link_prefs.push(PRef::invalid());
 				self.dirty.append();
 			}
 		} else {
@@ -266,137 +301,112 @@ impl MemTable {
 	fn remove_duplicate(&mut self, key: &[u8], hash: u32, bucket_number: usize) -> Result<bool, Error> {
 		let mut remove = None;
 		self.resolve_bucket(bucket_number)?;
-		if let Some(bucket) = self.buckets.write().unwrap().get_mut(bucket_number) {
-			if let Some(ref mut slots) = bucket.slots {
-				for (n, (_, pref)) in slots.iter().enumerate().filter(|s| (s.1).0 == hash) {
-					let envelope = self.data_file.get_envelope(*pref)?;
-					if let Payload::Indexed(indexed) = envelope.payload()? {
-						if indexed.key == key {
-							remove = Some(n);
-							break;
-						}
+
+		if let Some(bucket) = self.buckets.write().get_mut(&bucket_number) {
+			for (n, (_, pref)) in bucket.slots.iter().enumerate().filter(|s| (s.1).0 == hash) {
+				let envelope = self.data_file.get_envelope(*pref)?;
+				if let Payload::Indexed(indexed) = envelope.payload()? {
+					if indexed.key == key {
+						remove = Some(n);
+						break;
 					}
 				}
-				if let Some(r) = remove {
-					slots.remove(r);
-				}
+			}
+			if let Some(r) = remove {
+				bucket.slots.remove(r);
 			}
 		}
+
 		if remove.is_some() {
 			self.dirty.set(bucket_number);
 		}
 		Ok(remove.is_some())
 	}
 
-	fn store_to_bucket(&mut self, bucket: usize, hash: u32, pref: PRef) -> Result<(), Error> {
-		self.resolve_bucket(bucket)?;
-		if let Some(bucket) = self.buckets.write().unwrap().get_mut(bucket as usize) {
-			if let Some(ref mut slots) = bucket.slots {
-				slots.push((hash, pref));
-			} else {
-				bucket.slots = Some(vec![(hash, pref)]);
-			}
+	fn store_to_bucket(&mut self, bucket_number: usize, hash: u32, pref: PRef) -> Result<(), Error> {
+		self.resolve_bucket(bucket_number)?;
+
+		if let Some(bucket) = self.buckets.write().get_mut(&bucket_number) {
+			bucket.slots.push((hash, pref));
 		} else {
 			return Err(Error::Corrupted(
-				format!("memtable does not have the bucket {}", bucket).to_string(),
+				format!("memtable does not have the bucket {}", bucket_number).to_string(),
 			));
 		}
-		self.dirty.set(bucket);
+		self.dirty.set(bucket_number);
 		Ok(())
 	}
 
-	fn rehash_bucket(&mut self, bucket: usize) -> Result<(), Error> {
+	fn rehash_bucket(&mut self, bucket_number: usize) -> Result<(), Error> {
 		let mut rewrite = false;
 		let mut new_bucket_store = Bucket::default();
 		let mut moves = HashMap::new();
-		self.resolve_bucket(bucket)?;
-		if let Some(b) = self.buckets.read().unwrap().get(bucket as usize) {
-			if let Some(ref slots) = b.slots {
-				for (hash, pref) in slots {
-					let new_bucket = (hash & (!0u32 >> (32 - self.log_mod - 1))) as usize; // hash % 2^(log_mod + 1)
-					if new_bucket != bucket {
-						moves.entry(new_bucket).or_insert(Vec::new()).push((*hash, *pref));
-						rewrite = true;
-					} else {
-						if let Some(ref mut slots) = new_bucket_store.slots {
-							slots.push((*hash, *pref));
-						} else {
-							new_bucket_store.slots = Some(vec![(*hash, *pref)]);
-						}
-					}
+		self.resolve_bucket(bucket_number)?;
+
+		if let Some(b) = self.buckets.write().get(&bucket_number) {
+			for (hash, pref) in b.slots.iter() {
+				let new_bucket = (hash & (!0u32 >> (32 - self.log_mod - 1))) as usize; // hash % 2^(log_mod + 1)
+				if new_bucket != bucket_number {
+					moves.entry(new_bucket).or_insert(Vec::new()).push((*hash, *pref));
+					rewrite = true;
+				} else {
+					new_bucket_store.slots.push((*hash, *pref));
 				}
 			}
 		} else {
-			return Err(Error::Corrupted(format!("does not have bucket {} for rehash", bucket)));
+			return Err(Error::Corrupted(format!("does not have bucket {} for rehash", bucket_number)))
 		}
+
 		if rewrite {
 			for (bucket, added) in moves {
 				for (hash, pref) in added {
 					self.store_to_bucket(bucket, hash, pref)?;
 				}
 			}
-			self.buckets.write().unwrap()[bucket] = new_bucket_store;
-			self.dirty.set(bucket);
+			self.link_prefs[bucket_number] = PRef::invalid();
+			self.buckets.write().put(bucket_number, new_bucket_store);
+			self.dirty.set(bucket_number);
 		}
 		Ok(())
 	}
 
-	pub fn may_have_key(&self, key: &[u8]) -> Result<bool, Error> {
+	pub fn update_key(&mut self, key: &[u8], pref: PRef) -> Result<(), Error> {
 		let hash = self.hash(key);
 		let bucket_number = self.bucket_for_hash(hash);
 		self.resolve_bucket(bucket_number)?;
-		if let Some(bucket) = self.buckets.read().unwrap().get(bucket_number) {
-			if let Some(ref slots) = bucket.slots {
-				if slots.iter().any(|(h, _)| *h == hash) {
-					return Ok(true);
-				}
-			}
-		} else {
-			return Err(Error::Corrupted(format!("bucket {} should exist", bucket_number)));
-		}
-		Ok(false)
-	}
-
-	pub fn update_key(&self, key: &[u8], pref: PRef) -> Result<(), Error> {
-		let hash = self.hash(key);
-		let bucket_number = self.bucket_for_hash(hash);
-		self.resolve_bucket(bucket_number)?;
-		if let Some(bucket) = self.buckets.write().unwrap().get_mut(bucket_number) {
-			if let Some(ref mut slots) = bucket.slots {
-				for (h, data) in slots {
-					if *h == hash {
-						*data = pref
-					}
+		if let Some(bucket) = self.buckets.write().get_mut(&bucket_number) {
+			for (h, data) in bucket.slots.iter_mut() {
+				if *h == hash {
+					*data = pref
 				}
 			}
 		}
+		self.dirty.set(bucket_number);
 		Ok(())
 	}
 
 	// get the data last associated with the key
-	pub fn get(&self, key: &[u8]) -> Result<Option<(PRef, Vec<u8>)>, Error> {
+	pub fn get(&mut self, key: &[u8]) -> Result<Option<(PRef, Vec<u8>)>, Error> {
 		let hash = self.hash(key);
 		let bucket_number = self.bucket_for_hash(hash);
 		self.resolve_bucket(bucket_number)?;
-		if let Some(ref bucket) = self.buckets.read().unwrap().get(bucket_number) {
-			if let Some(ref slots) = bucket.slots {
-				for (h, data) in slots {
-					if *h == hash {
-						// If the database has been truncated then there may be keys that do not have data anymore.
-						if data.as_u64() > self.data_file.len()? {
-							return Ok(None);
+		if let Some(bucket) = self.buckets.write().get(&bucket_number) {
+			for (h, data) in bucket.slots.iter() {
+				if *h == hash {
+					// If the database has been truncated then there may be keys that do not have data anymore.
+					if data.as_u64() > self.data_file.len()? {
+						return Ok(None);
+					}
+					let envelope = self.data_file.get_envelope(*data)?;
+					if envelope.len() == 0 {
+						return Ok(None);
+					}
+					if let Payload::Indexed(indexed) = envelope.payload()? {
+						if indexed.key == key {
+							return Ok(Some((*data, indexed.data.data.to_vec())));
 						}
-						let envelope = self.data_file.get_envelope(*data)?;
-						if envelope.len() == 0 {
-							return Ok(None);
-						}
-						if let Payload::Indexed(indexed) = envelope.payload()? {
-							if indexed.key == key {
-								return Ok(Some((*data, indexed.data.data.to_vec())));
-							}
-						} else {
-							return Err(Error::Corrupted("pref should point to indexed data".to_string()));
-						}
+					} else {
+						return Err(Error::Corrupted("pref should point to indexed data".to_string()));
 					}
 				}
 			}
@@ -411,10 +421,10 @@ impl MemTable {
 			self.data_file.truncate(pref.as_u64())?;
 
 			let mut to_keep = vec![];
-			for bucket in self.buckets() {
-				if let Some(slots) = bucket.slots {
-					let keep: Vec<(u32, PRef)> = slots.iter().filter(|(_, p)| p < &pref).cloned().collect();
-					to_keep.push((bucket.stored, keep));
+			for (link_pref, bucket) in self.buckets() {
+				if !bucket.slots.is_empty() {
+					let keep: Vec<(u32, PRef)> = bucket.slots.iter().filter(|(_, p)| p < &pref).cloned().collect();
+					to_keep.push((link_pref, keep));
 				}
 			}
 
@@ -425,7 +435,7 @@ impl MemTable {
 				self.link_file.truncate(pref.next_page().as_u64())?;
 			}
 		}
-		self.link_file.flush()?;
+		self.batch()?;
 		Ok(())
 	}
 
@@ -439,6 +449,26 @@ impl MemTable {
 
 	fn hash(&self, key: &[u8]) -> u32 {
 		siphash24::Hash::hash_to_u64_with_keys(self.sip0, self.sip1, key) as u32
+	}
+}
+
+pub struct BucketIterator<'a> {
+	file: &'a mut MemTable,
+	n: usize,
+}
+
+impl<'a> Iterator for BucketIterator<'a> {
+	type Item = (PRef, Bucket);
+
+	fn next(&mut self) -> Option<<Self as Iterator>::Item> {
+		self.file.resolve_bucket(self.n).unwrap();
+		if let Some(pref) = self.file.link_prefs.get(self.n) {
+			if let Some(bucket) = self.file.buckets.write().get(&self.n) {
+				self.n += 1;
+				return Some((*pref, bucket.clone()));
+			}
+		}
+		None
 	}
 }
 
@@ -468,6 +498,10 @@ impl Dirty {
 		self.bits[n >> 6] |= 1 << (n & 0x3f);
 	}
 
+	pub fn clean(&mut self, n: usize) {
+		self.bits[n >> 6] ^= 1 << (n & 0x3f);
+	}
+
 	pub fn get(&self, n: usize) -> bool {
 		(self.bits[n >> 6] & (1 << (n & 0x3f))) != 0
 	}
@@ -490,24 +524,6 @@ impl Dirty {
 			let next = self.used;
 			self.set(next);
 		}
-	}
-}
-
-pub struct BucketIterator<'a> {
-	file: &'a MemTable,
-	n: usize,
-}
-
-impl<'a> Iterator for BucketIterator<'a> {
-	type Item = Bucket;
-
-	fn next(&mut self) -> Option<<Self as Iterator>::Item> {
-		self.file.resolve_bucket(self.n).unwrap();
-		if let Some(bucket) = self.file.buckets.read().unwrap().get(self.n) {
-			self.n += 1;
-			return Some(bucket.clone());
-		}
-		None
 	}
 }
 
@@ -537,8 +553,8 @@ impl<'b> Iterator for DirtyIterator<'b> {
 
 #[derive(Clone, Default)]
 pub struct Bucket {
-	pub stored: PRef,
-	pub slots: Option<Vec<(u32, PRef)>>,
+	// pub stored: PRef,
+	pub slots: Vec<(u32, PRef)>,
 }
 
 #[cfg(test)]
@@ -575,6 +591,11 @@ mod test {
 		dirty.append();
 		assert_eq!(format!("{:?}", dirty), "00000000000000000000000000000000000000000000000000000000000010010000000000000000000000000000000000000000000000000000000000000011");
 		assert!(dirty.get(65));
+
+		dirty.clean(3);
+		assert_eq!(format!("{:?}", dirty), "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000011");
+		dirty.clean(64);
+		assert_eq!(format!("{:?}", dirty), "00000000000000000000000000000000000000000000000000000000000000010000000000000000000000000000000000000000000000000000000000000010");
 	}
 
 	#[test]

@@ -60,7 +60,7 @@ mod test {
 			db.batch().unwrap();
 		}
 
-		let db = persistent(path, "test", 1).unwrap();
+		let mut db = persistent(path, "test", 1).unwrap();
 		let (pref, result) = db.get_keyed(key).unwrap().unwrap();
 		assert_eq!(pref, expected_pref);
 		assert_eq!(value, result.as_slice());

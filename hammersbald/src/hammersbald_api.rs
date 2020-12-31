@@ -33,7 +33,7 @@ pub trait HammersbaldAPI: Send + Sync {
 
 	/// retrieve data with key
 	/// returns Some(persistent reference, data) or None
-	fn get_keyed(&self, key: &[u8]) -> Result<Option<(u64, Vec<u8>)>, Error>;
+	fn get_keyed(&mut self, key: &[u8]) -> Result<Option<(u64, Vec<u8>)>, Error>;
 
 	/// store data
 	/// returns a persistent reference
@@ -41,15 +41,11 @@ pub trait HammersbaldAPI: Send + Sync {
 
 	/// retrieve data using a persistent reference
 	/// returns (key, data)
-	fn get(&self, pref: u64) -> Result<(Vec<u8>, Vec<u8>), Error>;
+	fn get(&mut self, pref: u64) -> Result<(Vec<u8>, Vec<u8>), Error>;
 
 	/// Update data at pref
 	/// returns same pref or error
 	fn set(&mut self, pref: u64, data: &[u8]) -> Result<u64, Error>;
-
-	/// a quick (in-memory) check if the db may have the key
-	/// this might return false positive, but if it is false key is definitely not used.
-	fn may_have_key(&self, key: &[u8]) -> Result<bool, Error>;
 
 	/// forget a key (if known)
 	/// This is not a real delete as data will be still accessible through its PRef, but contains hash table growth
@@ -62,7 +58,7 @@ pub trait HammersbaldAPI: Send + Sync {
 	fn iter(&self) -> HammersbaldIterator;
 
 	/// print database stats
-	fn stats(&self);
+	fn stats(&mut self);
 
 	fn size(&self) -> u64;
 }
@@ -151,7 +147,7 @@ impl Hammersbald {
 	}
 
 	/// get hash table bucket iterator
-	pub fn buckets<'a>(&'a self) -> impl Iterator<Item = Bucket> + 'a {
+	pub fn buckets<'a>(&'a mut self) -> impl Iterator<Item = (PRef, Bucket)> + 'a {
 		self.mem.buckets()
 	}
 
@@ -203,7 +199,7 @@ impl HammersbaldAPI for Hammersbald {
 		}
 	}
 
-	fn get_keyed(&self, key: &[u8]) -> Result<Option<(u64, Vec<u8>)>, Error> {
+	fn get_keyed(&mut self, key: &[u8]) -> Result<Option<(u64, Vec<u8>)>, Error> {
 		self.mem.get(key).map(|r| r.map(|o| (o.0.as_u64(), o.1)))
 	}
 
@@ -212,7 +208,7 @@ impl HammersbaldAPI for Hammersbald {
 		Ok(data_offset.as_u64())
 	}
 
-	fn get(&self, pref: u64) -> Result<(Vec<u8>, Vec<u8>), Error> {
+	fn get(&mut self, pref: u64) -> Result<(Vec<u8>, Vec<u8>), Error> {
 		match self.mem.get_envelope(pref.into())?.payload()? {
 			Payload::Referred(referred) => Ok((vec![], referred.data.to_vec())),
 			Payload::Indexed(indexed) => Ok((indexed.key.to_vec(), indexed.data.data.to_vec())),
@@ -223,10 +219,6 @@ impl HammersbaldAPI for Hammersbald {
 	fn set(&mut self, pref: u64, data: &[u8]) -> Result<u64, Error> {
 		let data_offset = self.mem.set(pref.into(), data)?;
 		Ok(data_offset.as_u64())
-	}
-
-	fn may_have_key(&self, key: &[u8]) -> Result<bool, Error> {
-		self.mem.may_have_key(key)
 	}
 
 	fn forget(&mut self, key: &[u8]) -> Result<(), Error> {
@@ -243,7 +235,7 @@ impl HammersbaldAPI for Hammersbald {
 		}
 	}
 
-	fn stats(&self) {
+	fn stats(&mut self) {
 		stats::stats(self)
 	}
 

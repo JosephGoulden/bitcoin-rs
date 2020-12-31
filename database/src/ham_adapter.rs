@@ -34,7 +34,7 @@ impl HamDb {
 	where
 		T: Deserializable,
 	{
-		let (_, v) = self.hammersbald.read().get(pref).map_err(from_ham)?;
+		let (_, v) = self.hammersbald.write().get(pref).map_err(from_ham)?;
 		let result = deserialize::<&[u8], T>(&v).map_err(from_serial)?;
 		return Ok(Some(result));
 	}
@@ -44,7 +44,7 @@ impl HamDb {
 		K: Serializable,
 		T: Deserializable,
 	{
-		if let Some((pref, v)) = self.hammersbald.read().get_keyed(&serialize(key)).map_err(from_ham)? {
+		if let Some((pref, v)) = self.hammersbald.write().get_keyed(&serialize(key)).map_err(from_ham)? {
 			let result = deserialize::<&[u8], T>(&v).map_err(from_serial)?;
 			return Ok(Some((pref, result)));
 		}
@@ -56,7 +56,7 @@ impl HamDb {
 		K: Deserializable,
 		T: Deserializable,
 	{
-		let (k, v) = self.hammersbald.read().get(pref).map_err(from_ham)?;
+		let (k, v) = self.hammersbald.write().get(pref).map_err(from_ham)?;
 		let key = deserialize::<&[u8], K>(&k).map_err(from_serial)?;
 		let result = deserialize::<&[u8], T>(&v).map_err(from_serial)?;
 		Ok(Some((key, result)))
@@ -66,7 +66,7 @@ impl HamDb {
 	where
 		K: Deserializable,
 	{
-		deserialize::<&[u8], K>(&self.hammersbald.read().get(pref).map_err(from_ham)?.0).map_err(from_serial)
+		deserialize::<&[u8], K>(&self.hammersbald.write().get(pref).map_err(from_ham)?.0).map_err(from_serial)
 	}
 
 	fn put<T>(&self, data: &T) -> Result<PRef, storage::Error>
@@ -285,7 +285,7 @@ impl DbInterface for HamDb {
 	}
 
 	fn stats(&self) -> Result<(), Error> {
-		self.hammersbald.read().stats();
+		self.hammersbald.write().stats();
 		Ok(())
 	}
 
